@@ -1,0 +1,81 @@
+:root {
+    --bg-dark: #050505;
+    --bg-panel: #0a0a0a;
+    --neon-green: #00FF41;
+    --border-dark: #1f1f1f;
+    --text-muted: #555;
+    --danger-red: #ff3333;
+}
+
+body {
+    background-color: var(--bg-dark);
+    color: var(--neon-green);
+    font-family: 'Courier New', Courier, monospace;
+    margin: 0;
+    padding: 0;
+}
+
+/* --- BUTTON STYLES --- */
+.btn {
+    background: transparent; 
+    border: 1px solid var(--neon-green);
+    color: var(--neon-green); 
+    padding: 8px 16px;
+    font-family: inherit; 
+    font-weight: bold; 
+    cursor: pointer;
+    text-transform: uppercase; 
+    transition: all 0.3s ease;
+}
+
+.btn:hover { 
+    background: var(--neon-green); 
+    color: var(--bg-dark); 
+    box-shadow: 0 0 10px rgba(0, 255, 65, 0.4);
+}
+
+.btn-danger { 
+    border-color: var(--danger-red); 
+    color: var(--danger-red); 
+}
+
+.btn-danger:hover { 
+    background: var(--danger-red); 
+    color: #fff; 
+    box-shadow: 0 0 10px rgba(255, 51, 51, 0.4);
+}
+
+/* Smaller buttons for the tables */
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 12px;
+}
+
+/* --- TAB BUTTONS (For Statistics Page) --- */
+.btn-tab {
+    background: transparent; 
+    border: 1px solid var(--border-dark); 
+    color: var(--text-muted);
+    padding: 10px 20px; 
+    font-family: inherit; 
+    font-size: 14px; 
+    cursor: pointer;
+    text-transform: uppercase; 
+    transition: all 0.3s ease; 
+    font-weight: bold; 
+    flex: 1;
+}
+
+/* When the chart is selected */
+.btn-tab.active {
+    border-color: var(--neon-green);
+    color: var(--neon-green);
+    background: rgba(0, 255, 65, 0.05);
+    box-shadow: 0 0 10px rgba(0, 255, 65, 0.1);
+}
+
+/* When you hover over an unselected chart button */
+.btn-tab:hover:not(.active) { 
+    color: #fff; 
+    border-color: #555; 
+}
