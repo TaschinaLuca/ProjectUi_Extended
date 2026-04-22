@@ -26,7 +26,12 @@ export default function Statistics() {
   const [currentUserEmail, setCurrentUserEmail] = useState('');
 
   const [chartType, setChartType] = useState(() => getCookie('preferredChartType') || 'pie');
+  
+  // --- NEW: PROJECT & TASK STATES ---
   const [tasks, setTasks] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState('ALL');
+  
   const [isLoading, setIsLoading] = useState(true);
 
   const [isInspectorOpen, setIsInspectorOpen] = useState(false);
@@ -37,14 +42,13 @@ export default function Statistics() {
 
   const { isOnline, queueAction, realtimePayload } = useOfflineSync(currentUserEmail);
 
-  // --- NEW: WEBSOCKET LISTENER FOR AUTO-UPDATE ---
+  // --- WEBSOCKET LISTENER ---
   useEffect(() => {
     if (realtimePayload) {
-      // 1. FILTER: Only accept data that belongs to the currently logged-in user!
       const myProjects = (realtimePayload.projects || []).filter(p => p.creatorEmail === currentUserEmail);
       const myTasks = (realtimePayload.tasks || []).filter(t => t.creatorEmail === currentUserEmail);
 
-      // 2. Append filtered Projects
+      // This will now safely append new generator projects to your filter dropdown!
       if (myProjects.length > 0 && typeof setProjects === 'function') {
         setProjects(prev => {
           const newProjects = myProjects.filter(np => !prev.some(p => p.id === np.id));
@@ -52,7 +56,6 @@ export default function Statistics() {
         });
       }
       
-      // 3. Append filtered Tasks
       if (myTasks.length > 0) {
         setTasks(prev => {
           const newTasks = myTasks.filter(nt => !prev.some(t => t.id === nt.id));
@@ -62,6 +65,7 @@ export default function Statistics() {
     }
   }, [realtimePayload, currentUserEmail]); 
 
+  // --- FETCH DATA ---
   useEffect(() => {
     const email = localStorage.getItem('loggedInUserEmail');
     if (!email) {
@@ -80,11 +84,15 @@ export default function Statistics() {
         const response = await fetch('http://localhost:3000/graphql', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            // NEW: We now query for projects alongside tasks to populate the dropdown
             query: `
-              query GetStatsTasks($email: String!) { 
+              query GetStatsData($email: String!) { 
                 tasksByUser(email: $email) { 
                   id projectId title description tags status completed predicted start end 
-                } 
+                }
+                projectsByUser(email: $email) {
+                  id title creatorEmail
+                }
               }
             `,
             variables: { email }
@@ -96,6 +104,7 @@ export default function Statistics() {
         
         if (json.data) { 
           setTasks(json.data.tasksByUser || []); 
+          setProjects(json.data.projectsByUser || []);
         }
       } catch (error) { 
         console.error("> SYSTEM ERROR fetching stats:", error.message); 
@@ -106,6 +115,7 @@ export default function Statistics() {
     fetchStats();
   }, [navigate]);
 
+  // --- ACTIONS ---
   const openInspector = (task = null) => {
     if (task) {
       setInspectorData({
@@ -116,7 +126,7 @@ export default function Statistics() {
       });
     } else {
       setInspectorData({
-        id: null, projectId: '', title: '', description: '', tags: '',
+        id: null, projectId: selectedProjectId !== 'ALL' ? selectedProjectId : '', title: '', description: '', tags: '',
         begin: formatDateForInput(new Date()), deadline: formatDateForInput(new Date(Date.now() + 86400000)),
         predicted: '', completed: false
       });
@@ -197,10 +207,18 @@ export default function Statistics() {
     setCookie('preferredChartType', type, 30);
   };
 
+  // --- NEW: DYNAMIC FILTERING LOGIC ---
+  // If "ALL" is selected, use all tasks. Otherwise, strictly filter by Project ID.
+  const filteredTasks = selectedProjectId === 'ALL' 
+    ? tasks 
+    : tasks.filter(t => parseInt(t.projectId) === parseInt(selectedProjectId));
+
   const dateNow = new Date();
-  const finishedTasks = tasks.filter(t => t.status === "completed" || t.completed === true).length;
-  const pendingTasks = tasks.filter(t => (t.status === "pending" || !t.completed) && new Date(t.end) >= dateNow).length;
-  const exceededTimeTasks = tasks.filter(t => (t.status === "pending" || !t.completed) && new Date(t.end) < dateNow).length;
+  
+  // Calculate stats based on the FILTERED tasks, not the master array!
+  const finishedTasks = filteredTasks.filter(t => t.status === "completed" || t.completed === true).length;
+  const pendingTasks = filteredTasks.filter(t => (t.status === "pending" || !t.completed) && new Date(t.end) >= dateNow).length;
+  const exceededTimeTasks = filteredTasks.filter(t => (t.status === "pending" || !t.completed) && new Date(t.end) < dateNow).length;
 
   const chartData = {
     labels: ['Finished', 'Pending', 'Exceeded Deadline'],
@@ -246,9 +264,28 @@ export default function Statistics() {
           &gt; Parallel Statistics <span style={{ color: 'var(--text-muted)' }}>[Master / Observer]</span>
         </h1>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '15px', marginBottom: '30px' }}>
-          <button onClick={() => handleChartChange('pie')} className={`btn ${chartType === 'pie' ? '' : 'btn-danger'}`} style={{ background: chartType === 'pie' ? 'var(--neon-green)' : '#222', color: chartType === 'pie' ? '#000' : '#888', flex: '1 1 auto' }}>Pie Chart</button>
-          <button onClick={() => handleChartChange('bar')} className={`btn ${chartType === 'bar' ? '' : 'btn-danger'}`} style={{ background: chartType === 'bar' ? 'var(--neon-green)' : '#222', color: chartType === 'bar' ? '#000' : '#888', flex: '1 1 auto' }}>Bar Chart</button>
+        {/* --- NEW: THE DROPDOWN FILTER & CHART CONTROLS --- */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '15px', marginBottom: '30px', background: 'var(--bg-panel)', padding: '15px', border: '1px solid var(--border-dark)' }}>
+          
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button onClick={() => handleChartChange('pie')} className={`btn ${chartType === 'pie' ? '' : 'btn-danger'}`} style={{ background: chartType === 'pie' ? 'var(--neon-green)' : '#222', color: chartType === 'pie' ? '#000' : '#888' }}>Pie Chart</button>
+            <button onClick={() => handleChartChange('bar')} className={`btn ${chartType === 'bar' ? '' : 'btn-danger'}`} style={{ background: chartType === 'bar' ? 'var(--neon-green)' : '#222', color: chartType === 'bar' ? '#000' : '#888' }}>Bar Chart</button>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+            <span style={{ color: 'var(--text-muted)', fontWeight: 'bold', fontSize: '14px' }}>FILTER BY PROJECT:</span>
+            <select 
+              value={selectedProjectId}
+              onChange={(e) => setSelectedProjectId(e.target.value)}
+              style={{ background: 'var(--bg-dark)', border: '1px solid var(--neon-green)', color: 'var(--neon-green)', padding: '8px 12px', outline: 'none', fontFamily: 'inherit', fontWeight: 'bold', minWidth: '200px' }}
+            >
+              <option value="ALL">&gt; ALL PROJECTS</option>
+              {projects.map(p => (
+                <option key={p.id} value={p.id}>[{p.id}] {p.title}</option>
+              ))}
+            </select>
+          </div>
+
         </div>
 
         {/* --- THE RESPONSIVE PARALLEL GRID --- */}
@@ -271,7 +308,8 @@ export default function Statistics() {
                   </tr>
                 </thead>
                 <tbody>
-                  {tasks.map(t => {
+                  {/* Notice we map over filteredTasks here! */}
+                  {filteredTasks.map(t => {
                     const isExceeded = (t.status !== 'completed' && !t.completed) && new Date(t.end) < dateNow;
                     let displayStatus = t.status.toUpperCase();
                     let statusColor = '#888';
@@ -300,8 +338,8 @@ export default function Statistics() {
                       </tr>
                     );
                   })}
-                  {tasks.length === 0 && (
-                    <tr><td colSpan="3" style={{ padding: '20px', textAlign: 'center', color: '#888' }}>No tasks found in database.</td></tr>
+                  {filteredTasks.length === 0 && (
+                    <tr><td colSpan="3" style={{ padding: '20px', textAlign: 'center', color: '#888' }}>No tasks match this filter.</td></tr>
                   )}
                 </tbody>
               </table>

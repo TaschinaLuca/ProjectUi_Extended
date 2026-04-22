@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { setCookie, getCookie } from '../telemetry';
 import PageTransition from './PageTransition';
-import {useOfflineSync} from '../useOfflineSync'
+import { useOfflineSync } from '../useOfflineSync';
 
 const formatDateForInput = (rawDate) => {
   if (!rawDate) return '';
@@ -26,22 +26,33 @@ export default function Workspace() {
   const navigate = useNavigate();
   const [currentUserEmail, setCurrentUserEmail] = useState('');
     
-  // Master Data State
+  // --- MASTER DATA STATE ---
   const [projects, setProjects] = useState([]);
   const [tasks, setTasks] = useState([]);
 
-  // --- NEW: INITIALIZE OFFLINE SYNC HOOK ---
+  // --- INFINITE SCROLL / PAGINATION STATE ---
+  const ITEMS_PER_PAGE = 10;
+  
+  const [taskOffset, setTaskOffset] = useState(0);
+  const [hasMoreTasks, setHasMoreTasks] = useState(true);
+  const [isFetchingTasks, setIsFetchingTasks] = useState(false);
+
+  const [projectOffset, setProjectOffset] = useState(0);
+  const [hasMoreProjects, setHasMoreProjects] = useState(true);
+  const [isFetchingProjects, setIsFetchingProjects] = useState(false);
+
+  const taskObserver = useRef();
+  const projectObserver = useRef();
+
+  // --- OFFLINE SYNC ---
   const { isOnline, queueAction, realtimePayload, isSimulatingOffline, setIsSimulatingOffline } = useOfflineSync(currentUserEmail);
 
-  // --- NEW: WEBSOCKET LISTENER ---
-  // --- NEW: WEBSOCKET LISTENER FOR AUTO-UPDATE ---
+  // --- WEBSOCKET LISTENER ---
   useEffect(() => {
     if (realtimePayload) {
-      // 1. FILTER: Only accept data that belongs to the currently logged-in user!
       const myProjects = (realtimePayload.projects || []).filter(p => p.creatorEmail === currentUserEmail);
       const myTasks = (realtimePayload.tasks || []).filter(t => t.creatorEmail === currentUserEmail);
 
-      // 2. Append filtered Projects
       if (myProjects.length > 0 && typeof setProjects === 'function') {
         setProjects(prev => {
           const newProjects = myProjects.filter(np => !prev.some(p => p.id === np.id));
@@ -49,7 +60,6 @@ export default function Workspace() {
         });
       }
       
-      // 3. Append filtered Tasks
       if (myTasks.length > 0) {
         setTasks(prev => {
           const newTasks = myTasks.filter(nt => !prev.some(t => t.id === nt.id));
@@ -59,11 +69,7 @@ export default function Workspace() {
     }
   }, [realtimePayload, currentUserEmail]); 
 
-  // --- NEW: PAGINATION STATE ---
-  const [projectPage, setProjectPage] = useState(1);
-  const [taskPage, setTaskPage] = useState(1);
-  const ITEMS_PER_PAGE = 10;
-
+  // --- MODAL STATE ---
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
   const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
   const [modalError, setModalError] = useState('');
@@ -75,14 +81,106 @@ export default function Workspace() {
   const [taskForm, setTaskForm] = useState(initialTaskForm);
   const [isPredicting, setIsPredicting] = useState(false);
 
+  // --- DATA FETCHING (PAGINATED) ---
+  const fetchProjectsBatch = async (email, currentOffset) => {
+    if (isFetchingProjects || !hasMoreProjects) return;
+    setIsFetchingProjects(true);
+
+    try {
+      const response = await fetch('http://localhost:3000/graphql', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: `query GetProjects($email: String!, $limit: Int, $offset: Int) {
+            projectsByUser(email: $email, limit: $limit, offset: $offset) { id title description tags creatorEmail associatedFiles associatedEmails }
+          }`,
+          variables: { email, limit: ITEMS_PER_PAGE, offset: currentOffset }
+        })
+      });
+      const json = await response.json();
+      const newBatch = json.data?.projectsByUser || [];
+
+      if (newBatch.length < ITEMS_PER_PAGE) setHasMoreProjects(false);
+      
+      setProjects(prev => {
+        const filtered = newBatch.filter(nb => !prev.some(p => p.id === nb.id));
+        return currentOffset === 0 ? newBatch : [...prev, ...filtered];
+      });
+      setProjectOffset(currentOffset + ITEMS_PER_PAGE);
+    } catch (err) { console.error("> NETWORK ERROR", err); }
+    finally { setIsFetchingProjects(false); }
+  };
+
+  const fetchTasksBatch = async (email, currentOffset) => {
+    if (isFetchingTasks || !hasMoreTasks) return;
+    setIsFetchingTasks(true);
+
+    try {
+      const response = await fetch('http://localhost:3000/graphql', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: `query GetTasks($email: String!, $limit: Int, $offset: Int) {
+            tasksByUser(email: $email, limit: $limit, offset: $offset) { id projectId title description tags status completed predicted start end }
+          }`,
+          variables: { email, limit: ITEMS_PER_PAGE, offset: currentOffset }
+        })
+      });
+      const json = await response.json();
+      const newBatch = json.data?.tasksByUser || [];
+
+      if (newBatch.length < ITEMS_PER_PAGE) setHasMoreTasks(false);
+
+      setTasks(prev => {
+        const filtered = newBatch.filter(nb => !prev.some(t => t.id === nb.id));
+        return currentOffset === 0 ? newBatch : [...prev, ...filtered];
+      });
+      setTaskOffset(currentOffset + ITEMS_PER_PAGE);
+    } catch (err) { console.error("> NETWORK ERROR", err); }
+    finally { setIsFetchingTasks(false); }
+  };
+
+  useEffect(() => {
+    const email = localStorage.getItem('loggedInUserEmail');
+    if (!email) { navigate('/login'); return; }
+    setCurrentUserEmail(email);
+    
+    // Initial Load
+    fetchProjectsBatch(email, 0);
+    fetchTasksBatch(email, 0);
+  }, []);
+
+  // --- PREFETCHING OBSERVERS ---
+  const lastTaskElementRef = useCallback(node => {
+    if (isFetchingTasks) return;
+    if (taskObserver.current) taskObserver.current.disconnect();
+    
+    taskObserver.current = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting && hasMoreTasks) {
+        fetchTasksBatch(currentUserEmail, taskOffset);
+      }
+    }, { rootMargin: '400px' }); 
+    
+    if (node) taskObserver.current.observe(node);
+  }, [isFetchingTasks, hasMoreTasks, taskOffset, currentUserEmail]);
+
+  const lastProjectElementRef = useCallback(node => {
+    if (isFetchingProjects) return;
+    if (projectObserver.current) projectObserver.current.disconnect();
+    
+    projectObserver.current = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting && hasMoreProjects) {
+        fetchProjectsBatch(currentUserEmail, projectOffset);
+      }
+    }, { rootMargin: '400px' });
+    
+    if (node) projectObserver.current.observe(node);
+  }, [isFetchingProjects, hasMoreProjects, projectOffset, currentUserEmail]);
+
+  // --- ACTIONS ---
   const startGenerator = async () => {
     try { 
       await fetch('http://localhost:3000/graphql', { 
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          query: `mutation StartGen($email: String!) { startGenerator(email: $email) }`,
-          variables: { email: currentUserEmail }
-        })
+        body: JSON.stringify({ query: `mutation StartGen($email: String!) { startGenerator(email: $email) }`, variables: { email: currentUserEmail } })
       }); 
     } catch (err) { console.error("Could not start generator."); }
   };
@@ -94,45 +192,6 @@ export default function Workspace() {
         body: JSON.stringify({ query: `mutation { stopGenerator }` })
       }); 
     } catch (err) { console.error("Could not stop generator."); }
-  };
-
-  useEffect(() => {
-    const email = localStorage.getItem('loggedInUserEmail');
-    if (!email) {
-      navigate('/login');
-      return;
-    }
-    setCurrentUserEmail(email);
-    fetchWorkspaceData(email);
-  }, [navigate]);
-
-  const fetchWorkspaceData = async (email) => {
-    try {
-      const response = await fetch('http://localhost:3000/graphql', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: `
-            query GetWorkspace($email: String!) {
-              projectsByUser(email: $email) { id title description tags creatorEmail associatedFiles associatedEmails }
-              tasksByUser(email: $email) { id projectId title description tags status completed predicted start end }
-            }
-          `,
-          variables: { email }
-        })
-      });
-      
-      const json = await response.json();
-      if (json.data) {
-        setProjects(json.data.projectsByUser || []);
-        setTasks(json.data.tasksByUser || []);
-        localStorage.setItem('cachedProjects', JSON.stringify(json.data.projectsByUser || []));
-        localStorage.setItem('cachedTasks', JSON.stringify(json.data.tasksByUser || []));
-      }
-    } catch (error) {
-      console.warn("> OFFLINE MODE: Loading cached workspace data.");
-      setProjects(JSON.parse(localStorage.getItem('cachedProjects') || '[]'));
-      setTasks(JSON.parse(localStorage.getItem('cachedTasks') || '[]'));
-    }
   };
 
   const handleLogout = () => {
@@ -155,7 +214,6 @@ export default function Workspace() {
     setIsProjectModalOpen(true);
   };
 
-  // --- UPDATED: SAVE PROJECT WITH QUEUEING ---
   const saveProject = async () => {
     setModalError('');
     const isNew = !projectForm.id;
@@ -172,7 +230,6 @@ export default function Workspace() {
     else setProjects(projects.map(p => p.id === uiPayload.id ? { ...p, ...uiPayload } : p));
     setIsProjectModalOpen(false);
 
-    // 2. STRICT Variables mapping
     const variables = isNew ? {
       title: uiPayload.title, description: uiPayload.description, creatorEmail: uiPayload.creatorEmail, tags: uiPayload.tags, associatedFiles: uiPayload.associatedFiles.join(','), associatedEmails: uiPayload.associatedEmails.join(',')
     } : {
@@ -180,15 +237,8 @@ export default function Workspace() {
     };
 
     const gqlPayload = {
-      query: isNew ? `
-        mutation CreateProject($title: String!, $description: String!, $creatorEmail: String!, $tags: [String!]!, $associatedFiles: String, $associatedEmails: String) {
-          createProject(title: $title, description: $description, creatorEmail: $creatorEmail, tags: $tags, associatedFiles: $associatedFiles, associatedEmails: $associatedEmails) { id }
-        }
-      ` : `
-        mutation UpdateProject($id: ID!, $title: String, $description: String, $tags: [String!], $associatedFiles: String, $associatedEmails: String) {
-          updateProject(id: $id, title: $title, description: $description, tags: $tags, associatedFiles: $associatedFiles, associatedEmails: $associatedEmails) { id }
-        }
-      `,
+      query: isNew ? `mutation CreateProject($title: String!, $description: String!, $creatorEmail: String!, $tags: [String!]!, $associatedFiles: String, $associatedEmails: String) { createProject(title: $title, description: $description, creatorEmail: $creatorEmail, tags: $tags, associatedFiles: $associatedFiles, associatedEmails: $associatedEmails) { id } }` 
+      : `mutation UpdateProject($id: ID!, $title: String, $description: String, $tags: [String!], $associatedFiles: String, $associatedEmails: String) { updateProject(id: $id, title: $title, description: $description, tags: $tags, associatedFiles: $associatedFiles, associatedEmails: $associatedEmails) { id } }`,
       variables
     };
 
@@ -200,10 +250,7 @@ export default function Workspace() {
     try {
       const response = await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(gqlPayload) });
       const json = await response.json();
-      
-      if (json.errors) {
-        throw new Error(json.errors[0].message);
-      }
+      if (json.errors) throw new Error(json.errors[0].message);
     } catch (err) {
       console.error("> SYSTEM ERROR saving project: ", err.message);
       queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
@@ -212,37 +259,18 @@ export default function Workspace() {
 
   const deleteProject = async (id) => {
     if (window.confirm("Remove Project? WARNING: This will cascade and delete all associated tasks locally and on the server!")) {
-      
-      // 1. Optimistic UI Update (Enforcing parseInt fixes GraphQL string/int mismatches!)
       const targetId = parseInt(id);
       setProjects(projects.filter(p => parseInt(p.id) !== targetId));
       setTasks(tasks.filter(t => parseInt(t.projectId) !== targetId));
 
-      const projectGqlPayload = {
-        query: `mutation DeleteProject($id: ID!) { deleteProject(id: $id) }`,
-        variables: { id: id.toString() }
-      };
+      const projectGqlPayload = { query: `mutation DeleteProject($id: ID!) { deleteProject(id: $id) }`, variables: { id: id.toString() } };
 
-      // 2. Offline Check
-      if (!isOnline) {
-        queueAction('http://localhost:3000/graphql', 'POST', projectGqlPayload);
-        // Notice we no longer need to queue up individual task deletions!
-        return; 
-      }
+      if (!isOnline) { queueAction('http://localhost:3000/graphql', 'POST', projectGqlPayload); return; }
 
-      // 3. Network Sync (Only ONE request needed now!)
       try {
-        const response = await fetch('http://localhost:3000/graphql', { 
-          method: 'POST', 
-          headers: { 'Content-Type': 'application/json' }, 
-          body: JSON.stringify(projectGqlPayload) 
-        });
-        
+        const response = await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(projectGqlPayload) });
         const json = await response.json();
-        
-        // Catch silent GraphQL errors
         if (json.errors) throw new Error(json.errors[0].message);
-
       } catch (err) { 
         console.error("> SYSTEM ERROR deleting project: ", err.message); 
         queueAction('http://localhost:3000/graphql', 'POST', projectGqlPayload);
@@ -284,7 +312,6 @@ export default function Workspace() {
     setModalError('');
     const isNew = !taskForm.id;
     
-    // 1. Manually construct UI Payload for instant React update
     const uiPayload = {
       id: isNew ? Date.now() : taskForm.id, projectId: parseInt(taskForm.projectId), title: taskForm.name, description: taskForm.description, creatorEmail: currentUserEmail, status: taskForm.completed ? 'completed' : 'pending', completed: taskForm.completed, tags: taskForm.tags.split('|').map(s => s.trim()).filter(Boolean), start: taskForm.begin, end: taskForm.deadline, predicted: parseFloat(taskForm.predicted) || 0
     };
@@ -293,7 +320,6 @@ export default function Workspace() {
     else setTasks(tasks.map(t => t.id === uiPayload.id ? { ...t, ...uiPayload } : t));
     setIsTaskModalOpen(false);
 
-    // 2. STRICT Variables matching EXACTLY what the mutation asks for
     const variables = isNew ? {
       projectId: uiPayload.projectId, title: uiPayload.title, description: uiPayload.description, creatorEmail: uiPayload.creatorEmail, status: uiPayload.status, completed: uiPayload.completed, tags: uiPayload.tags, end: uiPayload.end, predicted: uiPayload.predicted
     } : {
@@ -301,74 +327,35 @@ export default function Workspace() {
     };
 
     const gqlPayload = {
-      query: isNew ? `
-        mutation CreateTask($projectId: Int!, $title: String!, $description: String!, $creatorEmail: String!, $status: String!, $completed: Boolean!, $tags: [String!]!, $end: String!, $predicted: Float!) {
-          createTask(projectId: $projectId, title: $title, description: $description, creatorEmail: $creatorEmail, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id }
-        }
-      ` : `
-        mutation UpdateTask($id: ID!, $projectId: Int, $title: String, $description: String, $status: String, $completed: Boolean, $tags: [String!], $end: String, $predicted: Float) {
-          updateTask(id: $id, projectId: $projectId, title: $title, description: $description, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id }
-        }
-      `,
+      query: isNew ? `mutation CreateTask($projectId: Int!, $title: String!, $description: String!, $creatorEmail: String!, $status: String!, $completed: Boolean!, $tags: [String!]!, $end: String!, $predicted: Float!) { createTask(projectId: $projectId, title: $title, description: $description, creatorEmail: $creatorEmail, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id } }` 
+      : `mutation UpdateTask($id: ID!, $projectId: Int, $title: String, $description: String, $status: String, $completed: Boolean, $tags: [String!], $end: String, $predicted: Float) { updateTask(id: $id, projectId: $projectId, title: $title, description: $description, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id } }`,
       variables
     };
 
-    if (!isOnline) {
-      queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
-      return;
-    }
+    if (!isOnline) { queueAction('http://localhost:3000/graphql', 'POST', gqlPayload); return; }
 
     try {
       const response = await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(gqlPayload) });
       const json = await response.json();
-      
-      // THIS CATCHES SILENT GRAPHQL ERRORS!
-      if (json.errors) {
-        throw new Error(json.errors[0].message);
-      }
+      if (json.errors) throw new Error(json.errors[0].message);
     } catch (err) {
       console.error("> SYSTEM ERROR saving task: ", err.message);
       queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
     }
   };
    
-  // --- UPDATED: DELETE TASK WITH QUEUEING ---
   const deleteTask = async (id) => {
     if (window.confirm("Remove Task?")) {
       setTasks(tasks.filter(t => t.id !== id));
+      const gqlPayload = { query: `mutation DeleteTask($id: ID!) { deleteTask(id: $id) }`, variables: { id: id.toString() } };
 
-      const gqlPayload = {
-        query: `mutation DeleteTask($id: ID!) { deleteTask(id: $id) }`,
-        variables: { id: id.toString() }
-      };
-
-      if (!isOnline) {
-        queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
-        return;
-      }
+      if (!isOnline) { queueAction('http://localhost:3000/graphql', 'POST', gqlPayload); return; }
 
       try {
-        await fetch('http://localhost:3000/graphql', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(gqlPayload)
-        });
-      } catch (err) { 
-        queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
-      }
+        await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(gqlPayload) });
+      } catch (err) { queueAction('http://localhost:3000/graphql', 'POST', gqlPayload); }
     }
   };
-
-
-  // --- PAGINATION CALCULATIONS ---
-  // Calculates boundaries safely and ensures we never land on an empty 'page 3' if we just deleted its only item
-  const totalProjectPages = Math.max(1, Math.ceil(projects.length / ITEMS_PER_PAGE));
-  const currentProjectPage = Math.min(projectPage, totalProjectPages);
-  const currentProjects = projects.slice((currentProjectPage - 1) * ITEMS_PER_PAGE, currentProjectPage * ITEMS_PER_PAGE);
-
-  const totalTaskPages = Math.max(1, Math.ceil(tasks.length / ITEMS_PER_PAGE));
-  const currentTaskPage = Math.min(taskPage, totalTaskPages);
-  const currentTasks = tasks.slice((currentTaskPage - 1) * ITEMS_PER_PAGE, currentTaskPage * ITEMS_PER_PAGE);
-
 
   return (
     <PageTransition>
@@ -382,18 +369,9 @@ export default function Workspace() {
           </div>
         </div>
         
-        {/* NEW: THE DISCONNECT BUTTON */}
         <button 
           onClick={() => setIsSimulatingOffline(!isSimulatingOffline)}
-          style={{ 
-            background: isSimulatingOffline ? '#00FF41' : '#ff3333', 
-            color: '#000', 
-            border: 'none', 
-            padding: '5px 15px', 
-            fontWeight: 'bold', 
-            cursor: 'pointer',
-            borderRadius: '3px'
-          }}
+          style={{ background: isSimulatingOffline ? '#00FF41' : '#ff3333', color: '#000', border: 'none', padding: '5px 15px', fontWeight: 'bold', cursor: 'pointer', borderRadius: '3px' }}
         >
           {isSimulatingOffline ? "Reconnect App" : "Force Disconnect"}
         </button>
@@ -408,15 +386,9 @@ export default function Workspace() {
       </nav>
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '30px', background: 'var(--bg-panel)', padding: '15px', border: '1px solid var(--border-dark)' }}>
-          <span style={{ color: 'var(--text-muted)', fontWeight: 'bold', alignSelf: 'center', marginRight: '15px' }}>
-            SERVER DATA GENERATOR:
-          </span>
-          <button onClick={startGenerator} className="btn" style={{ background: '#00FF41', color: '#000', fontWeight: 'bold' }}>
-            ▶ START
-          </button>
-          <button onClick={stopGenerator} className="btn btn-danger" style={{ fontWeight: 'bold' }}>
-            ■ STOP
-          </button>
+          <span style={{ color: 'var(--text-muted)', fontWeight: 'bold', alignSelf: 'center', marginRight: '15px' }}>SERVER DATA GENERATOR:</span>
+          <button onClick={startGenerator} className="btn" style={{ background: '#00FF41', color: '#000', fontWeight: 'bold' }}>▶ START</button>
+          <button onClick={stopGenerator} className="btn btn-danger" style={{ fontWeight: 'bold' }}>■ STOP</button>
       </div>
 
       <div style={{ color: '#fff', borderBottom: '1px dashed var(--border-dark)', padding: 'clamp(15px, 3vw, 20px) clamp(15px, 5vw, 30px)' }}>
@@ -427,15 +399,14 @@ export default function Workspace() {
         
         {/* RESPONSIVE PROJECTS TABLE */}
         <div style={{ marginBottom: '50px', background: 'var(--bg-panel)', padding: 'clamp(15px, 3vw, 30px)', border: '1px solid var(--border-dark)' }}>
-          
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px', flexWrap: 'wrap', gap: '10px' }}>
             <h2 style={{ margin: 0 }}>User's Projects</h2>
             <button onClick={() => openProjectModal()} className="btn btn-sm">+ Add New Project</button>
           </div>
 
-          <div style={{ overflowX: 'auto' }}>
+          <div style={{ overflowX: 'auto', maxHeight: '400px' }}>
             <table style={{ width: '100%', minWidth: '600px', borderCollapse: 'collapse' }}>
-              <thead>
+              <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
                 <tr>
                   <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid var(--border-dark)', color: '#fff', background: '#111' }}>ID</th>
                   <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid var(--border-dark)', color: '#fff', background: '#111' }}>Title</th>
@@ -445,63 +416,42 @@ export default function Workspace() {
                 </tr>
               </thead>
               <tbody>
-                {currentProjects.length === 0 ? (
+                {projects.length === 0 ? (
                   <tr><td colSpan="5" style={{ padding: '20px', textAlign: 'center', color: '#888' }}>No projects available.</td></tr>
                 ) : (
-                  currentProjects.map(p => (
-                    <tr key={p.id}>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.id}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.title}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.tags ? p.tags.join(' | ') : ''}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.creatorEmail}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)', display: 'flex', gap: '10px' }}>
-                        <button onClick={() => openProjectModal(p)} className="btn btn-sm">Edit</button>
-                        <button onClick={() => deleteProject(p.id)} className="btn btn-sm btn-danger">Remove</button>
-                      </td>
-                    </tr>
-                  ))
+                  projects.map((p, index) => {
+                    const isLast = projects.length === index + 1;
+                    return (
+                      <tr key={p.id} ref={isLast ? lastProjectElementRef : null}>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.id}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.title}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.tags ? p.tags.join(' | ') : ''}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{p.creatorEmail}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)', display: 'flex', gap: '10px' }}>
+                          <button onClick={() => openProjectModal(p)} className="btn btn-sm">Edit</button>
+                          <button onClick={() => deleteProject(p.id)} className="btn btn-sm btn-danger">Remove</button>
+                        </td>
+                      </tr>
+                    )
+                  })
                 )}
               </tbody>
             </table>
-          </div>
-
-          {/* PROJECT PAGINATION FOOTER */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '15px', paddingTop: '15px', borderTop: '1px dashed var(--border-dark)', flexWrap: 'wrap', gap: '10px' }}>
-            <span style={{ color: 'var(--text-muted)', fontSize: '14px', fontWeight: 'bold', letterSpacing: '1px' }}>
-              PAGE {currentProjectPage} / {totalProjectPages}
-            </span>
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <button 
-                onClick={() => setProjectPage(p => Math.max(1, p - 1))} 
-                disabled={currentProjectPage === 1} 
-                className="btn btn-sm" 
-                style={{ opacity: currentProjectPage === 1 ? 0.3 : 1, cursor: currentProjectPage === 1 ? 'not-allowed' : 'pointer', padding: '5px 15px' }}
-              >
-                &lt; PREV
-              </button>
-              <button 
-                onClick={() => setProjectPage(p => Math.min(totalProjectPages, p + 1))} 
-                disabled={currentProjectPage === totalProjectPages} 
-                className="btn btn-sm" 
-                style={{ opacity: currentProjectPage === totalProjectPages ? 0.3 : 1, cursor: currentProjectPage === totalProjectPages ? 'not-allowed' : 'pointer', padding: '5px 15px' }}
-              >
-                NEXT &gt;
-              </button>
-            </div>
+            {isFetchingProjects && <div style={{ padding: '10px', textAlign: 'center', color: 'var(--neon-green)' }}>Loading more projects...</div>}
+            {!hasMoreProjects && projects.length > 0 && <div style={{ padding: '10px', textAlign: 'center', color: '#888' }}>End of projects list.</div>}
           </div>
         </div>
 
         {/* RESPONSIVE TASKS TABLE */}
         <div style={{ marginBottom: '50px', background: 'var(--bg-panel)', padding: 'clamp(15px, 3vw, 30px)', border: '1px solid var(--border-dark)' }}>
-          
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px', flexWrap: 'wrap', gap: '10px' }}>
             <h2 style={{ margin: 0 }}>User's Tasks</h2>
             <button onClick={() => openTaskModal()} className="btn btn-sm">+ Add New Task</button>
           </div>
 
-          <div style={{ overflowX: 'auto' }}>
+          <div style={{ overflowX: 'auto', maxHeight: '500px' }}>
             <table style={{ width: '100%', minWidth: '800px', borderCollapse: 'collapse' }}>
-              <thead>
+              <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
                 <tr>
                   <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid var(--border-dark)', color: '#fff', background: '#111' }}>ID</th>
                   <th style={{ padding: '12px', textAlign: 'left', borderBottom: '1px solid var(--border-dark)', color: '#fff', background: '#111' }}>Project ID</th>
@@ -513,63 +463,41 @@ export default function Workspace() {
                 </tr>
               </thead>
               <tbody>
-                {currentTasks.length === 0 ? (
+                {tasks.length === 0 ? (
                    <tr><td colSpan="7" style={{ padding: '20px', textAlign: 'center', color: '#888' }}>No tasks available.</td></tr>
                 ) : (
-                  currentTasks.map(t => (
-                    <tr key={t.id}>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.id}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>[{t.projectId || 'N/A'}]</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.title || t.name}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.tags ? t.tags.join(' | ') : ''}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.completed || t.status === 'completed' ? 'DONE' : 'PENDING'}</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.predicted || 0}h</td>
-                      <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)', display: 'flex', gap: '10px' }}>
-                        <button onClick={() => openTaskModal(t)} className="btn btn-sm">Edit</button>
-                        <button onClick={() => deleteTask(t.id)} className="btn btn-sm btn-danger">Remove</button>
-                      </td>
-                    </tr>
-                  ))
+                  tasks.map((t, index) => {
+                    const isLast = tasks.length === index + 1;
+                    return (
+                      <tr key={t.id} ref={isLast ? lastTaskElementRef : null}>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.id}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>[{t.projectId || 'N/A'}]</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.title || t.name}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.tags ? t.tags.join(' | ') : ''}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.completed || t.status === 'completed' ? 'DONE' : 'PENDING'}</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)' }}>{t.predicted || 0}h</td>
+                        <td style={{ padding: '12px', borderBottom: '1px solid var(--border-dark)', display: 'flex', gap: '10px' }}>
+                          <button onClick={() => openTaskModal(t)} className="btn btn-sm">Edit</button>
+                          <button onClick={() => deleteTask(t.id)} className="btn btn-sm btn-danger">Remove</button>
+                        </td>
+                      </tr>
+                    )
+                  })
                 )}
               </tbody>
             </table>
-          </div>
-
-          {/* TASK PAGINATION FOOTER */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '15px', paddingTop: '15px', borderTop: '1px dashed var(--border-dark)', flexWrap: 'wrap', gap: '10px' }}>
-            <span style={{ color: 'var(--text-muted)', fontSize: '14px', fontWeight: 'bold', letterSpacing: '1px' }}>
-              PAGE {currentTaskPage} / {totalTaskPages}
-            </span>
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <button 
-                onClick={() => setTaskPage(p => Math.max(1, p - 1))} 
-                disabled={currentTaskPage === 1} 
-                className="btn btn-sm" 
-                style={{ opacity: currentTaskPage === 1 ? 0.3 : 1, cursor: currentTaskPage === 1 ? 'not-allowed' : 'pointer', padding: '5px 15px' }}
-              >
-                &lt; PREV
-              </button>
-              <button 
-                onClick={() => setTaskPage(p => Math.min(totalTaskPages, p + 1))} 
-                disabled={currentTaskPage === totalTaskPages} 
-                className="btn btn-sm" 
-                style={{ opacity: currentTaskPage === totalTaskPages ? 0.3 : 1, cursor: currentTaskPage === totalTaskPages ? 'not-allowed' : 'pointer', padding: '5px 15px' }}
-              >
-                NEXT &gt;
-              </button>
-            </div>
+            {isFetchingTasks && <div style={{ padding: '10px', textAlign: 'center', color: 'var(--neon-green)' }}>Loading more tasks...</div>}
+            {!hasMoreTasks && tasks.length > 0 && <div style={{ padding: '10px', textAlign: 'center', color: '#888' }}>End of tasks list.</div>}
           </div>
         </div>
 
       </div>
 
-      {/* RESPONSIVE PROJECT MODAL WITH ERROR LOGGING */}
+      {/* PROJECT MODAL */}
       {isProjectModalOpen && (
         <div style={{ position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', background: 'rgba(5, 5, 5, 0.9)', zIndex: 1000, display: 'flex', justifyContent: 'center', alignItems: 'center', backdropFilter: 'blur(5px)', padding: '15px', boxSizing: 'border-box' }}>
           <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--neon-green)', padding: 'clamp(20px, 5vw, 30px)', width: '100%', maxWidth: '600px', maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 0 30px rgba(0, 255, 65, 0.1)', boxSizing: 'border-box' }}>
             <h2 style={{ marginTop: 0, fontSize: 'clamp(18px, 4vw, 24px)' }}>{projectForm.id ? "Inspect Project Page (Edit)" : "Add New Project Popup"}</h2>
-            
-            {/* The Error Display! */}
             {modalError && <div style={{ color: 'var(--danger-red)', fontSize: '12px', marginBottom: '15px', textShadow: '0 0 5px rgba(255, 51, 51, 0.5)' }}>{modalError}</div>}
 
             <div style={{ marginBottom: '15px' }}>
@@ -601,13 +529,11 @@ export default function Workspace() {
         </div>
       )}
 
-      {/* RESPONSIVE TASK MODAL WITH ERROR LOGGING */}
+      {/* TASK MODAL */}
       {isTaskModalOpen && (
         <div style={{ position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', background: 'rgba(5, 5, 5, 0.9)', zIndex: 1000, display: 'flex', justifyContent: 'center', alignItems: 'center', backdropFilter: 'blur(5px)', padding: '15px', boxSizing: 'border-box' }}>
           <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--neon-green)', padding: 'clamp(20px, 5vw, 30px)', width: '100%', maxWidth: '600px', maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 0 30px rgba(0, 255, 65, 0.1)', boxSizing: 'border-box' }}>
             <h2 style={{ marginTop: 0, fontSize: 'clamp(18px, 4vw, 24px)' }}>{taskForm.id ? "Inspect Task Page (Edit)" : "Add New Task Popup"}</h2>
-            
-            {/* The Error Display! */}
             {modalError && <div style={{ color: 'var(--danger-red)', fontSize: '12px', marginBottom: '15px', textShadow: '0 0 5px rgba(255, 51, 51, 0.5)' }}>{modalError}</div>}
 
             <div style={{ marginBottom: '15px' }}>
@@ -641,18 +567,8 @@ export default function Workspace() {
             <div style={{ marginBottom: '15px' }}>
               <label style={{ display: 'block', marginBottom: '5px', color: 'var(--text-muted)', fontSize: '14px' }}>Predicted Hours (AI)</label>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
-                <input 
-                  type="number" 
-                  value={taskForm.predicted} 
-                  onChange={e => setTaskForm({...taskForm, predicted: e.target.value})} 
-                  style={{ flex: '1 1 150px', padding: '10px', background: 'var(--bg-dark)', border: '1px solid var(--border-dark)', color: 'var(--neon-green)', boxSizing: 'border-box' }} 
-                />
-                <button 
-                  onClick={handleAIPredict} 
-                  disabled={isPredicting}
-                  className="btn" 
-                  style={{ flex: '1 1 120px', background: '#333', border: '1px solid var(--neon-green)', color: 'var(--neon-green)' }}
-                >
+                <input type="number" value={taskForm.predicted} onChange={e => setTaskForm({...taskForm, predicted: e.target.value})} style={{ flex: '1 1 150px', padding: '10px', background: 'var(--bg-dark)', border: '1px solid var(--border-dark)', color: 'var(--neon-green)', boxSizing: 'border-box' }} />
+                <button onClick={handleAIPredict} disabled={isPredicting} className="btn" style={{ flex: '1 1 120px', background: '#333', border: '1px solid var(--neon-green)', color: 'var(--neon-green)' }}>
                   {isPredicting ? "Thinking..." : "🧠 Ask AI"}
                 </button>
               </div>

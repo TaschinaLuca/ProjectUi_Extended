@@ -48,12 +48,24 @@ class Services{
         return this.#projects.find(project => project.id === id);
     }
 
-    getProjectsByUserEmail(userEmail){
-        return this.#projects.filter(project => project.creatorEmail === userEmail);
+    getProjectsByUserEmail(userEmail, limit, offset){
+        const results = this.#projects.filter(project => project.creatorEmail === userEmail);
+        
+        // Use != null to catch BOTH null and undefined from GraphQL
+        if (limit != null && offset != null) {
+            return results.slice(offset, offset + limit);
+        }
+        return results;
     }
 
-    getTasksByUserEmail(userEmail){
-        return this.#tasks.filter(task => task.creatorEmail === userEmail);
+    getTasksByUserEmail(userEmail, limit, offset){
+        const results = this.#tasks.filter(task => task.creatorEmail === userEmail);
+        
+        // Use != null to catch BOTH null and undefined from GraphQL
+        if (limit != null && offset != null) {
+            return results.slice(offset, offset + limit);
+        }
+        return results;
     }
 
     getTasksByProjectId(projectId){

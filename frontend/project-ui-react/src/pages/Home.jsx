@@ -74,24 +74,38 @@ export default function Home() {
 
   const fetchDashboardData = async (email) => {
     try {
-      const response = await fetch('http://localhost:3000/graphql', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query: `
-            query GetHome($email: String!) {
-              tasksByUser(email: $email) { id projectId title description tags status completed predicted end }
-              projectsByUser(email: $email) { id title description tags creatorEmail }
-            }
-          `,
-          variables: { email }
+      // Fire both independent GraphQL queries simultaneously
+      const [taskRes, projRes] = await Promise.all([
+        fetch('http://localhost:3000/graphql', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: `query GetHomeTasks($email: String!) { tasksByUser(email: $email) { id projectId title description tags status completed predicted end } }`,
+            variables: { email }
+          })
+        }),
+        fetch('http://localhost:3000/graphql', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: `query GetHomeProjects($email: String!) { projectsByUser(email: $email) { id title description tags creatorEmail } }`,
+            variables: { email }
+          })
         })
-      });
-      const json = await response.json();
-      if (json.data) {
-        setTasks(json.data.tasksByUser || []);
-        setProjects(json.data.projectsByUser || []);
-      }
-    } catch (error) { console.error("> SYSTEM ERROR: Failed to fetch dashboard data.", error); }
+      ]);
+
+      const taskJson = await taskRes.json();
+      const projJson = await projRes.json();
+
+      // Catch and log silent GraphQL crashes so you know exactly what is corrupted
+      if (taskJson.errors) console.error("> GRAPHQL TASK ERROR:", taskJson.errors[0].message);
+      if (projJson.errors) console.error("> GRAPHQL PROJECT ERROR:", projJson.errors[0].message);
+
+      // Independently set states so one failure doesn't wipe the whole dashboard
+      if (taskJson.data) setTasks(taskJson.data.tasksByUser || []);
+      if (projJson.data) setProjects(projJson.data.projectsByUser || []);
+
+    } catch (error) { 
+      console.error("> SYSTEM ERROR: Failed to fetch dashboard data.", error); 
+    }
   };
 
   // --- ACTIONS ---
