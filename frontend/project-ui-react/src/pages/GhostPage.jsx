@@ -37,20 +37,31 @@ export default function Ghost() {
 
     const fetchData = async () => {
       try {
-        const [projRes, taskRes] = await Promise.all([
-          fetch(`http://localhost:3000/api/projects/${email}`),
-          fetch(`http://localhost:3000/api/tasks/${email}`)
-        ]);
+        const response = await fetch('http://localhost:3000/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: `
+              query GetGhostData($email: String!) {
+                projectsByUser(email: $email) { id title }
+                tasksByUser(email: $email) { id projectId title tags status completed predicted start end }
+              }
+            `,
+            variables: { email }
+          })
+        });
 
-        if (projRes.ok && taskRes.ok) {
-          const projData = await projRes.json();
-          const taskData = await taskRes.json();
+        const json = await response.json();
+        
+        if (json.data) {
+          const projData = json.data.projectsByUser || [];
+          const taskData = json.data.tasksByUser || [];
           
-          setProjects(projData.data || []);
-          setTasks(taskData.data || []);
+          setProjects(projData);
+          setTasks(taskData);
           
-          if (projData.data && projData.data.length > 0) {
-            setSelectedProjectId(projData.data[0].id);
+          if (projData.length > 0) {
+            setSelectedProjectId(projData[0].id);
           }
         }
       } catch (error) {

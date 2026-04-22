@@ -39,26 +39,27 @@ export default function Home() {
   // --- NEW: WEBSOCKET LISTENER FOR AUTO-UPDATE ---
   useEffect(() => {
     if (realtimePayload) {
-      console.log("> HOME WS PAYLOAD RECEIVED:", realtimePayload); // Debugging ping
-      
-      // 1. Check for new Projects and append to the top
-      if (realtimePayload.projects && realtimePayload.projects.length > 0) {
+      // 1. FILTER: Only accept data that belongs to the currently logged-in user!
+      const myProjects = (realtimePayload.projects || []).filter(p => p.creatorEmail === currentUserEmail);
+      const myTasks = (realtimePayload.tasks || []).filter(t => t.creatorEmail === currentUserEmail);
+
+      // 2. Append filtered Projects
+      if (myProjects.length > 0 && typeof setProjects === 'function') {
         setProjects(prev => {
-          // Filter out duplicates just in case the server double-sends
-          const newProjects = realtimePayload.projects.filter(np => !prev.some(p => p.id === np.id));
+          const newProjects = myProjects.filter(np => !prev.some(p => p.id === np.id));
           return [...newProjects, ...prev];
         });
       }
       
-      // 2. Check for new Tasks and append to the top
-      if (realtimePayload.tasks && realtimePayload.tasks.length > 0) {
+      // 3. Append filtered Tasks
+      if (myTasks.length > 0) {
         setTasks(prev => {
-          const newTasks = realtimePayload.tasks.filter(nt => !prev.some(t => t.id === nt.id));
+          const newTasks = myTasks.filter(nt => !prev.some(t => t.id === nt.id));
           return [...newTasks, ...prev];
         });
       }
     }
-  }, [realtimePayload]);
+  }, [realtimePayload, currentUserEmail]); 
 
   // --- BOOT SEQUENCE ---
   useEffect(() => {
@@ -73,20 +74,24 @@ export default function Home() {
 
   const fetchDashboardData = async (email) => {
     try {
-      const taskRes = await fetch(`http://localhost:3000/api/tasks/${email}`);
-      if (taskRes.ok) {
-        const taskData = await taskRes.json();
-        setTasks(taskData.data || []);
+      const response = await fetch('http://localhost:3000/graphql', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: `
+            query GetHome($email: String!) {
+              tasksByUser(email: $email) { id projectId title description tags status completed predicted end }
+              projectsByUser(email: $email) { id title description tags creatorEmail }
+            }
+          `,
+          variables: { email }
+        })
+      });
+      const json = await response.json();
+      if (json.data) {
+        setTasks(json.data.tasksByUser || []);
+        setProjects(json.data.projectsByUser || []);
       }
-
-      const projRes = await fetch(`http://localhost:3000/api/projects/${email}`);
-      if (projRes.ok) {
-        const projData = await projRes.json();
-        setProjects(projData.data || []);
-      }
-    } catch (error) {
-      console.error("> SYSTEM ERROR: Failed to fetch dashboard data.", error);
-    }
+    } catch (error) { console.error("> SYSTEM ERROR: Failed to fetch dashboard data.", error); }
   };
 
   // --- ACTIONS ---
@@ -152,10 +157,12 @@ export default function Home() {
 
         // 2. Save the new prediction to the Node.js Database
         const updatedTask = { ...task, predicted: estimatedHours };
-        const dbResponse = await fetch(`http://localhost:3000/api/tasks/${task.id}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(updatedTask)
+        const dbResponse = await fetch('http://localhost:3000/graphql', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              query: `mutation UpdateAI($id: ID!, $predicted: Float!) { updateTask(id: $id, predicted: $predicted) { id } }`,
+              variables: { id: task.id.toString(), predicted: estimatedHours }
+            })
         });
 
         if (dbResponse.ok) {

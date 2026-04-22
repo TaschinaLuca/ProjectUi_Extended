@@ -98,6 +98,7 @@ class Services{
     deleteProject(id){
         const index = this.#projects.findIndex(project => project.id === id);
         if(index !== -1){
+            this.#tasks = this.#tasks.filter(task => task.projectId !== id);
             return this.#projects.splice(index, 1)[0];
         }
         return null;

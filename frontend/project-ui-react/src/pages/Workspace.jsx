@@ -34,19 +34,30 @@ export default function Workspace() {
   const { isOnline, queueAction, realtimePayload, isSimulatingOffline, setIsSimulatingOffline } = useOfflineSync(currentUserEmail);
 
   // --- NEW: WEBSOCKET LISTENER ---
+  // --- NEW: WEBSOCKET LISTENER FOR AUTO-UPDATE ---
   useEffect(() => {
     if (realtimePayload) {
-      // 1. If the payload contains new Projects, append them!
-      if (realtimePayload.projects && realtimePayload.projects.length > 0) {
-        setProjects(prev => [...realtimePayload.projects, ...prev]);
+      // 1. FILTER: Only accept data that belongs to the currently logged-in user!
+      const myProjects = (realtimePayload.projects || []).filter(p => p.creatorEmail === currentUserEmail);
+      const myTasks = (realtimePayload.tasks || []).filter(t => t.creatorEmail === currentUserEmail);
+
+      // 2. Append filtered Projects
+      if (myProjects.length > 0 && typeof setProjects === 'function') {
+        setProjects(prev => {
+          const newProjects = myProjects.filter(np => !prev.some(p => p.id === np.id));
+          return [...newProjects, ...prev];
+        });
       }
       
-      // 2. If the payload contains new Tasks, append them!
-      if (realtimePayload.tasks && realtimePayload.tasks.length > 0) {
-        setTasks(prev => [...realtimePayload.tasks, ...prev]);
+      // 3. Append filtered Tasks
+      if (myTasks.length > 0) {
+        setTasks(prev => {
+          const newTasks = myTasks.filter(nt => !prev.some(t => t.id === nt.id));
+          return [...newTasks, ...prev];
+        });
       }
     }
-  }, [realtimePayload]);
+  }, [realtimePayload, currentUserEmail]); 
 
   // --- NEW: PAGINATION STATE ---
   const [projectPage, setProjectPage] = useState(1);
@@ -65,13 +76,24 @@ export default function Workspace() {
   const [isPredicting, setIsPredicting] = useState(false);
 
   const startGenerator = async () => {
-    try { await fetch('http://localhost:3000/api/generate/start', { method: 'POST' }); } 
-    catch (err) { console.error("Could not start generator."); }
+    try { 
+      await fetch('http://localhost:3000/graphql', { 
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          query: `mutation StartGen($email: String!) { startGenerator(email: $email) }`,
+          variables: { email: currentUserEmail }
+        })
+      }); 
+    } catch (err) { console.error("Could not start generator."); }
   };
 
   const stopGenerator = async () => {
-      try { await fetch('http://localhost:3000/api/generate/stop', { method: 'POST' }); } 
-      catch (err) { console.error("Could not stop generator."); }
+    try { 
+      await fetch('http://localhost:3000/graphql', { 
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: `mutation { stopGenerator }` })
+      }); 
+    } catch (err) { console.error("Could not stop generator."); }
   };
 
   useEffect(() => {
@@ -86,21 +108,28 @@ export default function Workspace() {
 
   const fetchWorkspaceData = async (email) => {
     try {
-      const projRes = await fetch(`http://localhost:3000/api/projects/${email}`);
-      if (projRes.ok) {
-        const projData = await projRes.json();
-        setProjects(projData.data || []);
-        localStorage.setItem('cachedProjects', JSON.stringify(projData.data || [])); // CACHE IT
-      }
-      const taskRes = await fetch(`http://localhost:3000/api/tasks/${email}`);
-      if (taskRes.ok) {
-        const taskData = await taskRes.json();
-        setTasks(taskData.data || []);
-        localStorage.setItem('cachedTasks', JSON.stringify(taskData.data || [])); // CACHE IT
+      const response = await fetch('http://localhost:3000/graphql', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: `
+            query GetWorkspace($email: String!) {
+              projectsByUser(email: $email) { id title description tags creatorEmail associatedFiles associatedEmails }
+              tasksByUser(email: $email) { id projectId title description tags status completed predicted start end }
+            }
+          `,
+          variables: { email }
+        })
+      });
+      
+      const json = await response.json();
+      if (json.data) {
+        setProjects(json.data.projectsByUser || []);
+        setTasks(json.data.tasksByUser || []);
+        localStorage.setItem('cachedProjects', JSON.stringify(json.data.projectsByUser || []));
+        localStorage.setItem('cachedTasks', JSON.stringify(json.data.tasksByUser || []));
       }
     } catch (error) {
       console.warn("> OFFLINE MODE: Loading cached workspace data.");
-      // LOAD FROM CACHE IF FETCH FAILS
       setProjects(JSON.parse(localStorage.getItem('cachedProjects') || '[]'));
       setTasks(JSON.parse(localStorage.getItem('cachedTasks') || '[]'));
     }
@@ -131,75 +160,92 @@ export default function Workspace() {
     setModalError('');
     const isNew = !projectForm.id;
     
-    const payload = {
-      id: isNew ? Date.now() : projectForm.id, // Assign temporary ID if new
-      title: projectForm.title, 
-      description: projectForm.description, 
-      creatorEmail: currentUserEmail,
+    const uiPayload = {
+      id: isNew ? Date.now() : projectForm.id,
+      title: projectForm.title, description: projectForm.description, creatorEmail: currentUserEmail,
       tags: projectForm.tags.split('|').map(s => s.trim()).filter(Boolean),
       associatedFiles: projectForm.associatedFiles.split(',').map(s => s.trim()).filter(Boolean),
       associatedEmails: projectForm.associatedEmails.split(',').map(s => s.trim()).filter(Boolean)
     };
 
-    // 1. OPTIMISTIC UI UPDATE
-    if (isNew) setProjects([...projects, payload]);
-    else setProjects(projects.map(p => p.id === payload.id ? { ...p, ...payload } : p));
+    if (isNew) setProjects([...projects, uiPayload]);
+    else setProjects(projects.map(p => p.id === uiPayload.id ? { ...p, ...uiPayload } : p));
     setIsProjectModalOpen(false);
 
-    // 2. OFFLINE CHECK
+    // 2. STRICT Variables mapping
+    const variables = isNew ? {
+      title: uiPayload.title, description: uiPayload.description, creatorEmail: uiPayload.creatorEmail, tags: uiPayload.tags, associatedFiles: uiPayload.associatedFiles.join(','), associatedEmails: uiPayload.associatedEmails.join(',')
+    } : {
+      id: uiPayload.id.toString(), title: uiPayload.title, description: uiPayload.description, tags: uiPayload.tags, associatedFiles: uiPayload.associatedFiles.join(','), associatedEmails: uiPayload.associatedEmails.join(',')
+    };
+
+    const gqlPayload = {
+      query: isNew ? `
+        mutation CreateProject($title: String!, $description: String!, $creatorEmail: String!, $tags: [String!]!, $associatedFiles: String, $associatedEmails: String) {
+          createProject(title: $title, description: $description, creatorEmail: $creatorEmail, tags: $tags, associatedFiles: $associatedFiles, associatedEmails: $associatedEmails) { id }
+        }
+      ` : `
+        mutation UpdateProject($id: ID!, $title: String, $description: String, $tags: [String!], $associatedFiles: String, $associatedEmails: String) {
+          updateProject(id: $id, title: $title, description: $description, tags: $tags, associatedFiles: $associatedFiles, associatedEmails: $associatedEmails) { id }
+        }
+      `,
+      variables
+    };
+
     if (!isOnline) {
-      queueAction(isNew ? 'http://localhost:3000/api/projects' : `http://localhost:3000/api/projects/${payload.id}`, isNew ? 'POST' : 'PUT', payload);
+      queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
       return;
     }
 
-    // 3. ONLINE SYNC
     try {
-      if (isNew) {
-        await fetch('http://localhost:3000/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      } else {
-        await fetch(`http://localhost:3000/api/projects/${payload.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const response = await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(gqlPayload) });
+      const json = await response.json();
+      
+      if (json.errors) {
+        throw new Error(json.errors[0].message);
       }
     } catch (err) {
-      console.error("> SYSTEM ERROR saving project: ", err);
-      // If the network drops exactly during the fetch attempt, catch it and queue it!
-      queueAction(isNew ? 'http://localhost:3000/api/projects' : `http://localhost:3000/api/projects/${payload.id}`, isNew ? 'POST' : 'PUT', payload);
+      console.error("> SYSTEM ERROR saving project: ", err.message);
+      queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
     }
   };
 
-
-  // --- UPDATED: DELETE PROJECT WITH CASCADING QUEUEING ---
   const deleteProject = async (id) => {
-    if (window.confirm("Remove Project? WARNING: This will cascade and delete all associated tasks locally!")) {
+    if (window.confirm("Remove Project? WARNING: This will cascade and delete all associated tasks locally and on the server!")) {
       
-      // Identify tasks that belong to this project so we can delete them too
-      const tasksToDelete = tasks.filter(t => t.projectId === id);
+      // 1. Optimistic UI Update (Enforcing parseInt fixes GraphQL string/int mismatches!)
+      const targetId = parseInt(id);
+      setProjects(projects.filter(p => parseInt(p.id) !== targetId));
+      setTasks(tasks.filter(t => parseInt(t.projectId) !== targetId));
 
-      // 1. OPTIMISTIC UI UPDATE (Remove project AND its tasks instantly)
-      setProjects(projects.filter(p => p.id !== id));
-      setTasks(tasks.filter(t => t.projectId !== id));
+      const projectGqlPayload = {
+        query: `mutation DeleteProject($id: ID!) { deleteProject(id: $id) }`,
+        variables: { id: id.toString() }
+      };
 
-      // 2. OFFLINE CHECK
+      // 2. Offline Check
       if (!isOnline) {
-        // Queue the project deletion
-        queueAction(`http://localhost:3000/api/projects/${id}`, 'DELETE', {});
-        // Queue all the cascading task deletions
-        tasksToDelete.forEach(t => queueAction(`http://localhost:3000/api/tasks/${t.id}`, 'DELETE', {}));
-        return;
+        queueAction('http://localhost:3000/graphql', 'POST', projectGqlPayload);
+        // Notice we no longer need to queue up individual task deletions!
+        return; 
       }
 
-      // 3. ONLINE SYNC
+      // 3. Network Sync (Only ONE request needed now!)
       try {
-        await fetch(`http://localhost:3000/api/projects/${id}`, { method: 'DELETE' });
+        const response = await fetch('http://localhost:3000/graphql', { 
+          method: 'POST', 
+          headers: { 'Content-Type': 'application/json' }, 
+          body: JSON.stringify(projectGqlPayload) 
+        });
         
-        // Loop through and delete the associated tasks on the server
-        for (const task of tasksToDelete) {
-          await fetch(`http://localhost:3000/api/tasks/${task.id}`, { method: 'DELETE' });
-        }
+        const json = await response.json();
+        
+        // Catch silent GraphQL errors
+        if (json.errors) throw new Error(json.errors[0].message);
+
       } catch (err) { 
-        console.error("> SYSTEM ERROR deleting project: ", err); 
-        // If the fetch fails mid-flight, queue the remaining deletes
-        queueAction(`http://localhost:3000/api/projects/${id}`, 'DELETE', {});
-        tasksToDelete.forEach(t => queueAction(`http://localhost:3000/api/tasks/${t.id}`, 'DELETE', {}));
+        console.error("> SYSTEM ERROR deleting project: ", err.message); 
+        queueAction('http://localhost:3000/graphql', 'POST', projectGqlPayload);
       }
     }
   };
@@ -234,59 +280,80 @@ export default function Workspace() {
     } finally { setIsPredicting(false); }
   };
 
-  // --- UPDATED: SAVE TASK WITH QUEUEING ---
   const saveTask = async () => {
     setModalError('');
     const isNew = !taskForm.id;
-    const payload = {
-      id: isNew ? Date.now() : taskForm.id, // Assign temporary ID if new
-      projectId: parseInt(taskForm.projectId), title: taskForm.name, description: taskForm.description, creatorEmail: currentUserEmail,
-      status: taskForm.completed ? 'completed' : 'pending', completed: taskForm.completed,
-      tags: taskForm.tags.split('|').map(s => s.trim()).filter(Boolean), start: taskForm.begin, end: taskForm.deadline, predicted: parseFloat(taskForm.predicted) || 0
+    
+    // 1. Manually construct UI Payload for instant React update
+    const uiPayload = {
+      id: isNew ? Date.now() : taskForm.id, projectId: parseInt(taskForm.projectId), title: taskForm.name, description: taskForm.description, creatorEmail: currentUserEmail, status: taskForm.completed ? 'completed' : 'pending', completed: taskForm.completed, tags: taskForm.tags.split('|').map(s => s.trim()).filter(Boolean), start: taskForm.begin, end: taskForm.deadline, predicted: parseFloat(taskForm.predicted) || 0
     };
 
-    // 1. OPTIMISTIC UI UPDATE
-    if (isNew) setTasks([...tasks, payload]);
-    else setTasks(tasks.map(t => t.id === payload.id ? { ...t, ...payload } : t));
+    if (isNew) setTasks([...tasks, uiPayload]);
+    else setTasks(tasks.map(t => t.id === uiPayload.id ? { ...t, ...uiPayload } : t));
     setIsTaskModalOpen(false);
 
-    // 2. OFFLINE CHECK
+    // 2. STRICT Variables matching EXACTLY what the mutation asks for
+    const variables = isNew ? {
+      projectId: uiPayload.projectId, title: uiPayload.title, description: uiPayload.description, creatorEmail: uiPayload.creatorEmail, status: uiPayload.status, completed: uiPayload.completed, tags: uiPayload.tags, end: uiPayload.end, predicted: uiPayload.predicted
+    } : {
+      id: uiPayload.id.toString(), projectId: uiPayload.projectId, title: uiPayload.title, description: uiPayload.description, status: uiPayload.status, completed: uiPayload.completed, tags: uiPayload.tags, end: uiPayload.end, predicted: uiPayload.predicted
+    };
+
+    const gqlPayload = {
+      query: isNew ? `
+        mutation CreateTask($projectId: Int!, $title: String!, $description: String!, $creatorEmail: String!, $status: String!, $completed: Boolean!, $tags: [String!]!, $end: String!, $predicted: Float!) {
+          createTask(projectId: $projectId, title: $title, description: $description, creatorEmail: $creatorEmail, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id }
+        }
+      ` : `
+        mutation UpdateTask($id: ID!, $projectId: Int, $title: String, $description: String, $status: String, $completed: Boolean, $tags: [String!], $end: String, $predicted: Float) {
+          updateTask(id: $id, projectId: $projectId, title: $title, description: $description, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id }
+        }
+      `,
+      variables
+    };
+
     if (!isOnline) {
-      queueAction(isNew ? 'http://localhost:3000/api/tasks' : `http://localhost:3000/api/tasks/${payload.id}`, isNew ? 'POST' : 'PUT', payload);
+      queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
       return;
     }
 
-    // 3. ONLINE SYNC
     try {
-      if (isNew) {
-        await fetch('http://localhost:3000/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      } else {
-        await fetch(`http://localhost:3000/api/tasks/${payload.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const response = await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(gqlPayload) });
+      const json = await response.json();
+      
+      // THIS CATCHES SILENT GRAPHQL ERRORS!
+      if (json.errors) {
+        throw new Error(json.errors[0].message);
       }
     } catch (err) {
-      console.error("> SYSTEM ERROR saving task: ", err);
-      queueAction(isNew ? 'http://localhost:3000/api/tasks' : `http://localhost:3000/api/tasks/${payload.id}`, isNew ? 'POST' : 'PUT', payload);
+      console.error("> SYSTEM ERROR saving task: ", err.message);
+      queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
     }
   };
    
   // --- UPDATED: DELETE TASK WITH QUEUEING ---
   const deleteTask = async (id) => {
     if (window.confirm("Remove Task?")) {
-      // 1. OPTIMISTIC UI UPDATE
       setTasks(tasks.filter(t => t.id !== id));
 
-      // 2. OFFLINE CHECK
+      const gqlPayload = {
+        query: `mutation DeleteTask($id: ID!) { deleteTask(id: $id) }`,
+        variables: { id: id.toString() }
+      };
+
       if (!isOnline) {
-        queueAction(`http://localhost:3000/api/tasks/${id}`, 'DELETE', {});
+        queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
         return;
       }
 
-      // 3. ONLINE SYNC
       try {
-        await fetch(`http://localhost:3000/api/tasks/${id}`, { method: 'DELETE' });
+        await fetch('http://localhost:3000/graphql', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(gqlPayload)
+        });
       } catch (err) { 
-        console.error("> SYSTEM ERROR deleting task: ", err);
-        queueAction(`http://localhost:3000/api/tasks/${id}`, 'DELETE', {});
+        queueAction('http://localhost:3000/graphql', 'POST', gqlPayload);
       }
     }
   };

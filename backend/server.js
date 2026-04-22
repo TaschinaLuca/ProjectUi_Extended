@@ -2,21 +2,24 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http'); 
 const WebSocket = require('ws'); 
+const { ApolloServer } = require('@apollo/server');
+const { expressMiddleware } = require('@as-integrations/express4');
+
+const Services = require('./services');
+const { typeDefs, resolvers } = require('./schema');
 
 const app = express();
 const PORT = 3000;
+const appServices = new Services(); // Instantiate your in-memory DB
 
 app.use(cors()); 
 app.use(express.json());
 
-// Create the HTTP server and attach Express to it
+// 1. Create HTTP & WebSocket Servers
 const server = http.createServer(app);
-
-// Create the WebSocket Server attached to the HTTP server
 const wss = new WebSocket.Server({ server });
 
-// Create a global broadcast function so our routes can push data to clients
-app.locals.broadcast = (data) => {
+const broadcast = (data) => {
     wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify(data));
@@ -29,18 +32,31 @@ wss.on('connection', (ws) => {
     ws.on('close', () => console.log('> WEBSOCKET CLIENT DISCONNECTED'));
 });
 
-// Import and Connect Routers
-const userRouter = require('./router');
-app.use('/', userRouter);
-
-// The Heartbeat ping endpoint for your React Offline Hook
+// We keep this standard endpoint for your Offline Heartbeat check!
 app.get('/system/status', (req, res) => {
     res.status(200).json({ status: "ONLINE", message: "ProjectUi Backend Core is fully operational." });
 });
 
-// Start the server using `server.listen` instead of `app.listen`
-server.listen(PORT, () => {
-    console.log(`\n> SYSTEM BOOT SEQUENCE INITIATED...`);
-    console.log(`> HTTP & WEBSOCKET SERVER LISTENING ON PORT [${PORT}]`);
-    console.log(`> READY FOR CONNECTIONS AT: http://localhost:${PORT}\n`);
-});
+// 2. Initialize Apollo Server
+const startServer = async () => {
+    const apolloServer = new ApolloServer({
+        typeDefs,
+        resolvers,
+    });
+
+    await apolloServer.start();
+
+    // 3. Mount GraphQL at exactly ONE endpoint: /graphql
+    // We pass `appServices` and `broadcast` into the context so resolvers can access them
+    app.use('/graphql', expressMiddleware(apolloServer, {
+        context: async () => ({ appServices, broadcast }), 
+    }));
+
+    server.listen(PORT, () => {
+        console.log(`\n> SYSTEM BOOT SEQUENCE INITIATED...`);
+        console.log(`> GRAPHQL & WEBSOCKET SERVER LISTENING ON PORT [${PORT}]`);
+        console.log(`> GRAPHQL PLAYGROUND AT: http://localhost:${PORT}/graphql\n`);
+    });
+};
+
+startServer();

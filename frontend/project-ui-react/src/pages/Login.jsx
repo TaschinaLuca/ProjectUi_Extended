@@ -44,21 +44,29 @@ export default function Login() {
     }
 
     try {
-      // SECURE POST REQUEST! We send the attempt, we don't download the user.
-      const response = await fetch('http://localhost:3000/api/login', {
+      const response = await fetch('http://localhost:3000/graphql', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password })
+        body: JSON.stringify({
+          query: `
+            mutation Login($email: String!, $password: String!) {
+              login(email: $email, passwordHash: $password) {
+                message
+                data { email }
+              }
+            }
+          `,
+          variables: { email, password }
+        })
       });
       
-      if (response.ok) {
-        // Server confirmed password is correct
-        localStorage.setItem('loggedInUserEmail', email);
-        navigate('/presentation'); 
+      const resData = await response.json();
+      
+      if (resData.errors) {
+        setGeneralError(`> AUTH ERROR: ${resData.errors[0].message}`);
       } else {
-        // Server rejected the attempt (404 Not Found or 401 Unauthorized)
-        const errData = await response.json();
-        setGeneralError(`> AUTH ERROR: ${errData.error}`);
+        localStorage.setItem('loggedInUserEmail', resData.data.login.data.email);
+        navigate('/presentation'); 
       }
     } catch (err) {
       console.error(err);
@@ -79,33 +87,31 @@ export default function Login() {
     }
 
     try {
-      const newUserData = {
-        username: username,
-        email: email,
-        passwordHash: password, 
-        experienceYears: parseInt(experience) || 0
-      };
-
-      const createRes = await fetch('http://localhost:3000/api/users', {
+      const response = await fetch('http://localhost:3000/graphql', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newUserData)
+        body: JSON.stringify({
+          query: `
+            mutation Register($username: String!, $email: String!, $password: String!, $experience: Int!) {
+              register(username: $username, email: $email, passwordHash: $password, experienceYears: $experience) {
+                message
+              }
+            }
+          `,
+          variables: { username, email, password, experience: parseInt(experience) || 0 }
+        })
       });
 
-      if (createRes.ok) {
-        setSuccessMsg('> SYSTEM MESSAGE: USER INITIALIZED SUCCESSFULLY. PLEASE LOGIN.');
-        setUsername('');
-        setConfirmPassword('');
-        setExperience('');
-        setPassword('');
-        setActiveTab('login'); 
+      const resData = await response.json();
+
+      if (resData.errors) {
+        setGeneralError(`> SERVER REJECTED: ${resData.errors[0].message}`);
       } else {
-        // Automatically catches 400 Validation Errors and 409 Conflict Errors from our new backend!
-        const errData = await createRes.json();
-        setGeneralError(`> SERVER REJECTED: ${errData.error}`);
+        setSuccessMsg('> SYSTEM MESSAGE: USER INITIALIZED SUCCESSFULLY. PLEASE LOGIN.');
+        setUsername(''); setConfirmPassword(''); setExperience(''); setPassword('');
+        setActiveTab('login'); 
       }
-    }
-    catch(err){
+    } catch(err){
       console.error(err);
       setGeneralError('> CRITICAL ERROR: COULD NOT REACH THE BACKEND.');
     }

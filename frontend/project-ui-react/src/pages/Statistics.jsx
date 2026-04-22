@@ -40,17 +40,27 @@ export default function Statistics() {
   // --- NEW: WEBSOCKET LISTENER FOR AUTO-UPDATE ---
   useEffect(() => {
     if (realtimePayload) {
-      console.log("> STATISTICS WS PAYLOAD RECEIVED:", realtimePayload); // Debugging ping
+      // 1. FILTER: Only accept data that belongs to the currently logged-in user!
+      const myProjects = (realtimePayload.projects || []).filter(p => p.creatorEmail === currentUserEmail);
+      const myTasks = (realtimePayload.tasks || []).filter(t => t.creatorEmail === currentUserEmail);
+
+      // 2. Append filtered Projects
+      if (myProjects.length > 0 && typeof setProjects === 'function') {
+        setProjects(prev => {
+          const newProjects = myProjects.filter(np => !prev.some(p => p.id === np.id));
+          return [...newProjects, ...prev];
+        });
+      }
       
-      // Update charts instantly by appending new tasks to state
-      if (realtimePayload.tasks && realtimePayload.tasks.length > 0) {
+      // 3. Append filtered Tasks
+      if (myTasks.length > 0) {
         setTasks(prev => {
-          const newTasks = realtimePayload.tasks.filter(nt => !prev.some(t => t.id === nt.id));
+          const newTasks = myTasks.filter(nt => !prev.some(t => t.id === nt.id));
           return [...newTasks, ...prev];
         });
       }
     }
-  }, [realtimePayload]);
+  }, [realtimePayload, currentUserEmail]); 
 
   useEffect(() => {
     const email = localStorage.getItem('loggedInUserEmail');
@@ -67,14 +77,29 @@ export default function Statistics() {
 
     const fetchStats = async () => {
       try {
-        const response = await fetch(`http://localhost:3000/api/tasks/${email}`);
-        if (response.ok) {
-          const json = await response.json();
-          setTasks(json.data || []); 
+        const response = await fetch('http://localhost:3000/graphql', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: `
+              query GetStatsTasks($email: String!) { 
+                tasksByUser(email: $email) { 
+                  id projectId title description tags status completed predicted start end 
+                } 
+              }
+            `,
+            variables: { email }
+          })
+        });
+        const json = await response.json();
+        
+        if (json.errors) throw new Error(json.errors[0].message);
+        
+        if (json.data) { 
+          setTasks(json.data.tasksByUser || []); 
         }
-      } catch (error) {
-        console.error("> SYSTEM ERROR:", error);
-      } finally {
+      } catch (error) { 
+        console.error("> SYSTEM ERROR fetching stats:", error.message); 
+      } finally { 
         setIsLoading(false); 
       }
     };
@@ -118,21 +143,34 @@ export default function Statistics() {
   const handleSaveEntity = async () => {
     if (!inspectorData.title.trim()) { alert("Task name is required."); return; }
     const isNew = !inspectorData.id;
-    const payload = {
-      id: isNew ? Date.now() : inspectorData.id, projectId: parseInt(inspectorData.projectId) || null,
+    
+    const uiPayload = {
+      id: isNew ? Date.now() : inspectorData.id, projectId: parseInt(inspectorData.projectId) || 0,
       title: inspectorData.title, description: inspectorData.description, creatorEmail: currentUserEmail,
       status: inspectorData.completed ? 'completed' : 'pending', completed: inspectorData.completed,
       tags: inspectorData.tags.split('|').map(s => s.trim()).filter(Boolean),
       start: inspectorData.begin, end: inspectorData.deadline, predicted: parseFloat(inspectorData.predicted) || 0
     };
 
-    if (isNew) setTasks([...tasks, payload]);
-    else setTasks(tasks.map(t => t.id === payload.id ? { ...t, ...payload } : t));
+    if (isNew) setTasks([...tasks, uiPayload]);
+    else setTasks(tasks.map(t => t.id === uiPayload.id ? { ...t, ...uiPayload } : t));
     setIsInspectorOpen(false); 
 
+    const gqlPayload = {
+      query: isNew ? `
+        mutation CreateTask($projectId: Int!, $title: String!, $description: String!, $creatorEmail: String!, $status: String!, $completed: Boolean!, $tags: [String!]!, $end: String!, $predicted: Float!) {
+          createTask(projectId: $projectId, title: $title, description: $description, creatorEmail: $creatorEmail, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id }
+        }
+      ` : `
+        mutation UpdateTask($id: ID!, $projectId: Int, $title: String, $description: String, $status: String, $completed: Boolean, $tags: [String!], $end: String, $predicted: Float) {
+          updateTask(id: $id, projectId: $projectId, title: $title, description: $description, status: $status, completed: $completed, tags: $tags, end: $end, predicted: $predicted) { id }
+        }
+      `,
+      variables: { ...uiPayload, id: uiPayload.id.toString() }
+    };
+
     try {
-      if (isNew) await fetch('http://localhost:3000/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      else await fetch(`http://localhost:3000/api/tasks/${payload.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      await fetch('http://localhost:3000/graphql', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(gqlPayload) });
     } catch (err) { console.error("> ERROR saving via inspector:", err); }
   };
 
@@ -141,7 +179,15 @@ export default function Statistics() {
     if (window.confirm("Remove Task?")) {
       setTasks(tasks.filter(t => t.id !== inspectorData.id));
       setIsInspectorOpen(false);
-      try { await fetch(`http://localhost:3000/api/tasks/${inspectorData.id}`, { method: 'DELETE' }); } 
+      try { 
+        await fetch('http://localhost:3000/graphql', { 
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, 
+          body: JSON.stringify({
+            query: `mutation DeleteTask($id: ID!) { deleteTask(id: $id) }`,
+            variables: { id: inspectorData.id.toString() }
+          }) 
+        }); 
+      } 
       catch (err) { console.error("> ERROR deleting task:", err); }
     }
   };
